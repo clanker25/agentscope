@@ -1,0 +1,197 @@
+# -*- coding: utf-8 -*-
+"""DingTalk interactive-card helpers for tool approval.
+
+DingTalk cards use a template created in the Card Platform. The template
+round-trips only an opaque approval id; routing and authorization data stay
+in server-side state.
+"""
+
+import json
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ....message import ToolCallBlock
+
+# A template author reaches for the same word the card's own status uses,
+# so the settled spellings are accepted alongside the imperative ones.
+_APPROVE_ACTIONS = frozenset(
+    {"allow", "approve", "approved", "accept", "agree"},
+)
+_DENY_ACTIONS = frozenset({"deny", "denied", "reject"})
+
+# DingTalk's general AI card renders the components its layout names and
+# takes its buttons with them, so an approval card needs no template of
+# the operator's own. A button reports its ``id`` when clicked.
+_PENDING_LAYOUT = json.dumps(
+    {
+        "order": ["msgTitle", "staticMsgContent", "msgButtons"],
+        "msgButtons": [
+            {
+                "text": "✅ 同意",
+                "color": "blue",
+                "id": "agree",
+                "request": True,
+            },
+            {
+                "text": "🚫 拒绝",
+                "color": "gray",
+                "id": "reject",
+                "request": True,
+            },
+        ],
+    },
+    ensure_ascii=False,
+)
+_SETTLED_LAYOUT = json.dumps({"order": ["msgTitle", "staticMsgContent"]})
+_PENDING_TITLE = "工具审批"
+# DingTalk caps one cardParamMap value at 1KB, so this bounds what a
+# card is created and updated with. It says nothing about the streaming
+# endpoint, which documents no limit of its own.
+_PARAM_VALUE_BUDGET = 800
+
+
+@dataclass(frozen=True, slots=True)
+class _ApprovalDecision:
+    """A validated decision parsed from a DingTalk card callback."""
+
+    out_track_id: str
+    user_id: str
+    approved: bool
+
+
+def _approval_card_data(
+    tool: "ToolCallBlock",
+    agent_name: str,
+    approval_id: str = "",
+) -> dict[str, str]:
+    """Build the parameter map consumed by the configured card template.
+
+    A template of the operator's own binds the tool call under the field
+    names it already has — ``name``, ``input`` and ``created_at`` — so
+    authoring one needs no vocabulary beyond the block being approved.
+    ``status`` is the card's own lifecycle, which the block does not
+    carry: its own state stays ``asking`` throughout.
+
+    Args:
+        tool (`ToolCallBlock`): The tool call awaiting a decision.
+        agent_name (`str`): The agent that asked, for the ready-made
+            ``title``; the built-in card does not show it.
+        approval_id (`str`): Opaque key for authoritative server-side state.
+
+    Returns:
+        `dict[str, str]`: DingTalk card template parameter map.
+    """
+    # A card parameter value is capped at 1KB, which a Chinese argument
+    # reaches in a third of the characters a counted trim would allow.
+    # Nothing else here is caller-sized.
+    encoded = tool.input.encode("utf-8")
+    shown = encoded[:_PARAM_VALUE_BUDGET].decode("utf-8", "ignore")
+    if len(encoded) > _PARAM_VALUE_BUDGET:
+        shown += "…"
+    # Markdown reads a lone newline as a space, so the two lines need a
+    # blank one between them to stay two lines.
+    data = {
+        # What the built-in AI card renders.
+        "msgTitle": _PENDING_TITLE,
+        "staticMsgContent": f"工具：{tool.name}\n\n参数：{shown}",
+        "sys_full_json_obj": _PENDING_LAYOUT,
+        # What a template of the operator's own binds.
+        "title": f"{agent_name} 提交的工具执行".strip(),
+        "name": tool.name,
+        "input": shown,
+        "created_at": tool.created_at[:19].replace("T", " "),
+        "status": "pending",
+    }
+    if approval_id:
+        data["approvalId"] = approval_id
+    return data
+
+
+def _resolved_card_data(approved: bool) -> dict[str, str]:
+    """Build card parameters used after a decision.
+
+    Args:
+        approved (`bool`): Whether the tool call was approved.
+
+    Returns:
+        `dict[str, str]`: Replacement values for the card template.
+    """
+    return {
+        # Settling drops the buttons: the decision is already made. The
+        # flow status has to be repeated — an update that omits it leaves
+        # the AI card with nothing to render.
+        "msgTitle": _PENDING_TITLE,
+        "staticMsgContent": ("✅ 已同意，工具继续执行。" if approved else "🚫 已拒绝。"),
+        "sys_full_json_obj": _SETTLED_LAYOUT,
+        "flowStatus": "3",
+        "status": "approved" if approved else "denied",
+    }
+
+
+def _parse_card_callback(payload: Any) -> _ApprovalDecision | None:
+    """Parse and validate one advanced-card action callback.
+
+    Button params identify the action. The platform supplies the card's
+    ``outTrackId`` and the clicker's ``userId``.
+
+    Args:
+        payload (`Any`): Callback data supplied by the Stream SDK.
+
+    Returns:
+        `_ApprovalDecision | None`: Parsed decision, or ``None`` for a
+        malformed or unrelated callback.
+    """
+    if not isinstance(payload, dict):
+        return None
+    # Deliberately no check on ``type``: the official SDK never reads it,
+    # so its wire values are undocumented and gating on them drops every
+    # callback the moment DingTalk sends one we did not guess.
+    content = _json_object(payload.get("content"))
+    private_data = _json_object(content.get("cardPrivateData"))
+    params = _json_object(private_data.get("params"))
+
+    # A button built into the layout reports itself by ``id``; a template
+    # authored with an explicit action reports that instead. The sibling
+    # ``actionIds`` names the layout node, which identifies nothing.
+    action = (
+        str(params.get("action") or params.get("id") or "").strip().lower()
+    )
+    if action in _APPROVE_ACTIONS:
+        approved = True
+    elif action in _DENY_ACTIONS:
+        approved = False
+    else:
+        return None
+
+    user_id = _field(payload, "userId", "user_id")
+    out_track_id = _field(payload, "outTrackId", "out_track_id")
+    if not all((user_id, out_track_id)):
+        return None
+    return _ApprovalDecision(
+        out_track_id=out_track_id,
+        user_id=user_id,
+        approved=approved,
+    )
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    """Return a mapping from a mapping or JSON object string."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+    return {}
+
+
+def _field(mapping: dict[str, Any], *names: str) -> str:
+    """Read the first non-empty string representation of named fields."""
+    for name in names:
+        value = str(mapping.get(name) or "").strip()
+        if value:
+            return value
+    return ""

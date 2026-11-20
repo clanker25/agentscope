@@ -1,0 +1,23 @@
+name: qwen-flash
+label: Qwen-Flash
+status: active
+# Release date source: https://help.aliyun.com/zh/model-studio/newly-released-models
+release_date: 2025-08-05
+
+input_types:
+  - text/plain
+  - application/x-thinking
+
+output_types:
+  - text/plain
+  - application/x-thinking
+
+context_size: 2000000
+output_size: 32768
+
+parameter_overrides:
+  max_tokens: {"maximum": 65536}
+  # Voice only applies to omni-style models; hide the field for this
+  # non-omni model so the frontend popover doesn't render it.
+  voice:
+    hidden: true

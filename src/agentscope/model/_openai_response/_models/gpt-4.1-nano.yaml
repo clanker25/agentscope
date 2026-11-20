@@ -1,0 +1,28 @@
+name: gpt-4.1-nano
+label: GPT-4.1 Nano (Responses API)
+status: deprecated
+# Release date source: https://developers.openai.com/api/docs/changelog
+release_date: 2024-04-14
+deprecated_at: "2026-10-23T00:00:00"
+
+input_types:
+  - text/plain
+  - image/jpeg
+  - image/png
+  - image/gif
+  - image/webp
+  - application/pdf
+
+output_types:
+  - text/plain
+
+context_size: 1047576
+output_size: 32768
+
+parameter_overrides:
+  max_tokens:
+    maximum: 16384
+  thinking_enable:
+    hidden: true
+  reasoning_effort:
+    hidden: true
